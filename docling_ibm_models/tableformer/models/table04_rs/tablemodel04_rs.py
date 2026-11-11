@@ -1,4 +1,5 @@
 import logging
+import os
 
 import torch
 import torch.nn as nn
@@ -63,6 +64,15 @@ class TableModel04_rs(BaseModel, nn.Module):
         self._enc_image_size = config["model"]["enc_image_size"]
 
         self._max_pred_len = config["predict"]["max_steps"]
+        # See TMTransformerDecoder.step. Off unless asked for: it changes the
+        # last bits of the decoder's numbers.
+        self._incremental_decoding = bool(
+            config["predict"].get("incremental_decoding", False)
+        ) or os.environ.get("DOCLING_TABLEFORMER_INCREMENTAL", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
 
         self._tag_transformer = Tag_Transformer(
             device,
@@ -175,20 +185,47 @@ class TableModel04_rs(BaseModel, nn.Module):
         # each layer's cross-attention keys and values once, not once per tag.
         memory_kv = self._tag_transformer._decoder.precompute_memory_kv(encoder_out)
 
+        # Opt-in: decode from cached self-attention keys/values too, one row
+        # per step (results agree to float32 rounding, not bit for bit).
+        step_state = None
+        if (
+            self._incremental_decoding
+            and memory_kv is not None
+            and not self._tag_transformer._positional_encoding.training
+            and self._tag_transformer._decoder.can_step()
+        ):
+            step_state = self._tag_transformer._decoder.new_step_state(
+                min(self._max_pred_len + 1, 256), batch_size
+            )
+
         # i = 0
         while len(output_tags) < self._max_pred_len:
-            decoded_embedding = self._tag_transformer._embedding(decoded_tags)
-            decoded_embedding = self._tag_transformer._positional_encoding(
-                decoded_embedding
-            )
             AggProfiler().begin("model_tag_transformer_decoder", self._prof)
-            decoded, cache = self._tag_transformer._decoder(
-                decoded_embedding,
-                encoder_out,
-                cache,
-                memory_key_padding_mask=encoder_mask,
-                memory_kv=memory_kv,
-            )
+            if step_state is not None:
+                # Embed the newest tag only; the earlier ones live on as the
+                # cached keys and values in `step_state`.
+                position = decoded_tags.size(0) - 1
+                decoded_embedding = (
+                    self._tag_transformer._embedding(decoded_tags[-1:])
+                    + self._tag_transformer._positional_encoding.pe[
+                        position : position + 1
+                    ]
+                )
+                decoded = self._tag_transformer._decoder.step(
+                    decoded_embedding, memory_kv, step_state
+                )
+            else:
+                decoded_embedding = self._tag_transformer._embedding(decoded_tags)
+                decoded_embedding = self._tag_transformer._positional_encoding(
+                    decoded_embedding
+                )
+                decoded, cache = self._tag_transformer._decoder(
+                    decoded_embedding,
+                    encoder_out,
+                    cache,
+                    memory_key_padding_mask=encoder_mask,
+                    memory_kv=memory_kv,
+                )
             AggProfiler().end("model_tag_transformer_decoder", self._prof)
             # Grab last feature to produce token
             AggProfiler().begin("model_tag_transformer_fc", self._prof)

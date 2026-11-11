@@ -145,3 +145,40 @@ def test_bbox_decoder_matches_per_cell_reference():
     assert torch.equal(classes, expected_classes)
     assert torch.equal(boxes, expected_boxes)
     assert no_classes.numel() == 0 and no_boxes.numel() == 0
+
+
+def test_step_decoding_agrees_with_full_decoding():
+    """`step` appends one key/value row per tag instead of projecting the
+    whole sequence again. Same numbers up to float32 rounding (a row
+    projected alone and inside a longer matrix differ in the last bits)."""
+    decoder = _decoder()
+    torch.manual_seed(3)
+    memory = torch.randn(POSITIONS, 1, EMBED_DIM)
+    steps = 40
+    torch.manual_seed(11)
+    tags = torch.randn(steps, 1, EMBED_DIM)
+
+    with torch.no_grad():
+        memory_kv = decoder.precompute_memory_kv(memory)
+        assert decoder.can_step()
+        # capacity 8: the buffers must grow three times on the way to 40
+        state = decoder.new_step_state(max_len=8)
+        cache = None
+        for step in range(steps):
+            expected, cache = decoder(
+                tags[: step + 1], memory, cache, memory_kv=memory_kv
+            )
+            actual = decoder.step(tags[step : step + 1], memory_kv, state)
+
+            # `forward` returns the whole sequence so far, `step` the newest tag
+            assert actual.shape == (1, 1, EMBED_DIM)
+            assert torch.allclose(actual[-1], expected[-1], rtol=1e-4, atol=1e-5)
+
+    assert all(layer_state.length == steps for layer_state in state)
+
+
+def test_step_decoding_is_not_offered_in_training_mode():
+    decoder = _decoder()
+    decoder.train()
+
+    assert decoder.can_step() is False

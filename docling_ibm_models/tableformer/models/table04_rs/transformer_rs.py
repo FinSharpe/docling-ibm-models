@@ -35,6 +35,20 @@ class PositionalEncoding(nn.Module):
 MemoryKV = Tuple[Tensor, Tensor]
 
 
+class StepState:
+    """One layer's self-attention keys and values of the tags decoded so far,
+    (bsz, heads, capacity, head_dim), of which the first `length` are filled."""
+
+    def __init__(self, k: Tensor, v: Tensor):
+        self.k = k
+        self.v = v
+        self.length = 0
+
+    def grow(self) -> None:
+        self.k = torch.cat([self.k, torch.empty_like(self.k)], dim=2)
+        self.v = torch.cat([self.v, torch.empty_like(self.v)], dim=2)
+
+
 class TMTransformerDecoder(nn.TransformerDecoder):
     def precompute_memory_kv(self, memory: Tensor) -> Optional[List[MemoryKV]]:
         """Each layer's cross-attention keys and values of `memory`.
@@ -50,6 +64,45 @@ class TMTransformerDecoder(nn.TransformerDecoder):
                 return None
             memory_kv.append(mod.project_memory(memory))
         return memory_kv
+
+    def can_step(self) -> bool:
+        """Whether `step` can stand in for `forward` (inference only)."""
+        return all(mod.can_use_memory_kv() and mod.can_step() for mod in self.layers)
+
+    def new_step_state(self, max_len: int, bsz: int = 1) -> List["StepState"]:
+        """Empty per-layer self-attention key/value buffers for `step`."""
+        return [mod.new_step_state(max_len, bsz) for mod in self.layers]
+
+    def step(
+        self,
+        tgt_last_tok: Tensor,
+        memory_kv: List[MemoryKV],
+        state: List["StepState"],
+    ) -> Tensor:
+        """Decode one more tag from the embedding of the newest tag alone.
+
+        `forward` gets every layer's whole input sequence at every step and
+        projects all of it to self-attention keys and values again, although
+        only the newest row is new. `step` keeps each layer's keys and values
+        in `state` and appends one row, so a step costs the same however long
+        the sequence is.
+
+        It is the same arithmetic on the same numbers, but not bit for bit:
+        a row projected alone and the same row projected inside a longer
+        matrix can differ in the last bits (the BLAS kernel depends on the
+        matrix shape). Results agree to float32 rounding.
+
+        Args:
+            tgt_last_tok: embedded newest tag, (1, bsz, hidden_dim)
+            memory_kv: `precompute_memory_kv(memory)`
+            state: `new_step_state(...)`, updated in place
+        Returns:
+            the last layer's output for the newest tag, (1, bsz, hidden_dim)
+        """
+        output = tgt_last_tok
+        for mod, kv, layer_state in zip(self.layers, memory_kv, state):
+            output = mod.step(output, kv, layer_state)
+        return output
 
     def forward(  # type: ignore
         self,
@@ -167,6 +220,82 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
         )
         attn_output = F.linear(attn_output, mha.out_proj.weight, mha.out_proj.bias)
         return attn_output.view(tgt_len, bsz, attn_output.size(1))
+
+    def can_step(self) -> bool:
+        """Whether self attention can run from cached keys and values."""
+        mha = self.self_attn
+        return (
+            not self.training
+            and mha._qkv_same_embed_dim
+            and mha.in_proj_weight is not None
+            and mha.bias_k is None
+            and mha.bias_v is None
+            and not mha.add_zero_attn
+            and not mha.batch_first
+        )
+
+    def new_step_state(self, max_len: int, bsz: int = 1) -> "StepState":
+        mha = self.self_attn
+        head_dim = mha.embed_dim // mha.num_heads
+        weight = mha.in_proj_weight
+        shape = (bsz, mha.num_heads, max_len, head_dim)
+        return StepState(
+            k=torch.empty(shape, dtype=weight.dtype, device=weight.device),
+            v=torch.empty(shape, dtype=weight.dtype, device=weight.device),
+        )
+
+    def step(
+        self, tgt_last_tok: Tensor, memory_kv: MemoryKV, state: "StepState"
+    ) -> Tensor:
+        """`forward` for the newest tag, with the keys and values of the
+        earlier tags taken from `state` (see `TMTransformerDecoder.step`)."""
+        mha = self.self_attn
+        embed_dim = mha.embed_dim
+        num_heads = mha.num_heads
+        head_dim = embed_dim // num_heads
+        _, bsz, _ = tgt_last_tok.shape
+
+        w_q, w_kv = mha.in_proj_weight.split([embed_dim, embed_dim * 2])
+        b_q = b_kv = None
+        if mha.in_proj_bias is not None:
+            b_q, b_kv = mha.in_proj_bias.split([embed_dim, embed_dim * 2])
+        q = F.linear(tgt_last_tok, w_q, b_q)
+        kv_proj = F.linear(tgt_last_tok, w_kv, b_kv)
+        kv_proj = (
+            kv_proj.unflatten(-1, (2, embed_dim))
+            .unsqueeze(0)
+            .transpose(0, -2)
+            .squeeze(-2)
+            .contiguous()
+        )
+        q = q.view(1, bsz * num_heads, head_dim).transpose(0, 1)
+        q = q.view(bsz, num_heads, 1, head_dim)
+        pos = state.length
+        if pos >= state.k.shape[2]:
+            state.grow()
+        state.k[:, :, pos] = kv_proj[0].view(bsz, num_heads, head_dim)
+        state.v[:, :, pos] = kv_proj[1].view(bsz, num_heads, head_dim)
+        state.length = pos + 1
+        k = state.k[:, :, : pos + 1]
+        v = state.v[:, :, : pos + 1]
+
+        attn_output = F.scaled_dot_product_attention(q, k, v, None, 0.0, False)
+        attn_output = attn_output.permute(2, 0, 1, 3).contiguous().view(bsz, embed_dim)
+        attn_output = F.linear(attn_output, mha.out_proj.weight, mha.out_proj.bias)
+        tmp_tgt = attn_output.view(1, bsz, attn_output.size(1))
+        tgt_last_tok = tgt_last_tok + self.dropout1(tmp_tgt)
+        tgt_last_tok = self.norm1(tgt_last_tok)
+
+        tmp_tgt = self._cross_attention(tgt_last_tok, memory_kv)
+        tgt_last_tok = tgt_last_tok + self.dropout2(tmp_tgt)
+        tgt_last_tok = self.norm2(tgt_last_tok)
+
+        tmp_tgt = self.linear2(
+            self.dropout(self.activation(self.linear1(tgt_last_tok)))
+        )
+        tgt_last_tok = tgt_last_tok + self.dropout3(tmp_tgt)
+        tgt_last_tok = self.norm3(tgt_last_tok)
+        return tgt_last_tok
 
     def forward(  # type: ignore
         self,
