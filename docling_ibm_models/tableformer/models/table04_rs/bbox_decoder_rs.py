@@ -60,6 +60,24 @@ class CellAttention(nn.Module):
         attention_weighted_encoding = (encoder_out * alpha.unsqueeze(2)).sum(dim=1)
         return attention_weighted_encoding, alpha
 
+    def forward_precomputed(
+        self, encoder_out, encoder_att, decoder_hidden, language_att
+    ):
+        """
+        `forward`, given its two terms that do not depend on the cell.
+        :param encoder_att: `self._encoder_att(encoder_out)`
+        :param language_att: `self._language_att(language_out)`
+        :return: attention weighted encoding, weights
+        """
+        att2 = self._tag_decoder_att(decoder_hidden)  # (num_cells, tag_decoder_dim)
+        att = self._full_att(
+            self._relu(encoder_att + att2.unsqueeze(1) + language_att.unsqueeze(1))
+        ).squeeze(2)
+        alpha = self._softmax(att)  # (num_cells, num_pixels)
+        # (num_cells, encoder_dim)
+        attention_weighted_encoding = (encoder_out * alpha.unsqueeze(2)).sum(dim=1)
+        return attention_weighted_encoding, alpha
+
 
 class BBoxDecoder(nn.Module):
     """
@@ -140,14 +158,23 @@ class BBoxDecoder(nn.Module):
         predictions_bboxes = []
         predictions_classes = []
 
+        if num_cells > 0:
+            # Every cell starts from the same hidden state, so everything that
+            # depends only on it and on the encoded image is the same for all
+            # cells: compute it once, not once per cell.
+            h0 = self._init_hidden_state(encoder_out, 1)
+            encoder_att = self._attention._encoder_att(encoder_out)
+            language_att = self._attention._language_att(h0)
+            gate = self._sigmoid(self._f_beta(h0))
+
         for c_id in range(num_cells):
             # Start decoding
-            h = self._init_hidden_state(encoder_out, 1)
             cell_tag_H = tag_H[c_id]
-            awe, _ = self._attention(encoder_out, cell_tag_H, h)
-            gate = self._sigmoid(self._f_beta(h))
+            awe, _ = self._attention.forward_precomputed(
+                encoder_out, encoder_att, cell_tag_H, language_att
+            )
             awe = gate * awe
-            h = awe * h
+            h = awe * h0
 
             predictions_bboxes.append(self._bbox_embed(h).sigmoid())
             predictions_classes.append(self._class_embed(h))

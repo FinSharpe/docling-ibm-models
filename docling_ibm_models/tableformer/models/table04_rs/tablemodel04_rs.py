@@ -171,6 +171,10 @@ class TableModel04_rs(BaseModel, nn.Module):
         cur_bbox_ind = -1
         bbox_ind = 0
 
+        # The encoded image is the same at every decoding step: project it to
+        # each layer's cross-attention keys and values once, not once per tag.
+        memory_kv = self._tag_transformer._decoder.precompute_memory_kv(encoder_out)
+
         # i = 0
         while len(output_tags) < self._max_pred_len:
             decoded_embedding = self._tag_transformer._embedding(decoded_tags)
@@ -183,6 +187,7 @@ class TableModel04_rs(BaseModel, nn.Module):
                 encoder_out,
                 cache,
                 memory_key_padding_mask=encoder_mask,
+                memory_kv=memory_kv,
             )
             AggProfiler().end("model_tag_transformer_decoder", self._prof)
             # Grab last feature to produce token
